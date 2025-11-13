@@ -1,4 +1,4 @@
-// Package quic 实现了基于 QUIC 协议的高性能、可靠的网络连接池管理系统
+// Package quic 实现了基于QUIC协议的高性能、可靠的网络连接池管理系统
 package quic
 
 import (
@@ -32,31 +32,31 @@ const (
 	defaultALPN             = "np-quic"
 )
 
-// Pool QUIC 连接池结构体，用于管理 QUIC streams
+// Pool QUIC连接池结构体，用于管理QUIC流
 type Pool struct {
-	streams      sync.Map                      // 存储 stream 的映射表
-	idChan       chan string                   // 可用 stream ID 通道
-	tlsCode      string                        // TLS 安全模式代码
+	streams      sync.Map                      // 存储流的映射表
+	idChan       chan string                   // 可用流ID通道
+	tlsCode      string                        // TLS安全模式代码
 	hostname     string                        // 主机名
-	clientIP     string                        // 客户端 IP
-	tlsConfig    *tls.Config                   // TLS 配置
+	clientIP     string                        // 客户端IP
+	tlsConfig    *tls.Config                   // TLS配置
 	targetAddr   string                        // 目标地址
 	listenAddr   string                        // 监听地址
 	errCount     atomic.Int32                  // 错误计数
 	capacity     atomic.Int32                  // 当前容量
 	minCap       int                           // 最小容量
 	maxCap       int                           // 最大容量
-	interval     atomic.Int64                  // stream 创建间隔
+	interval     atomic.Int64                  // 流创建间隔
 	minIvl       time.Duration                 // 最小间隔
 	maxIvl       time.Duration                 // 最大间隔
 	keepAlive    time.Duration                 // 保活间隔
 	ctx          context.Context               // 上下文
 	cancel       context.CancelFunc            // 取消函数
-	quicConn     atomic.Pointer[quic.Conn]     // QUIC 连接
-	quicListener atomic.Pointer[quic.Listener] // QUIC 监听器
+	quicConn     atomic.Pointer[quic.Conn]     // QUIC连接
+	quicListener atomic.Pointer[quic.Listener] // QUIC监听器
 }
 
-// StreamConn 将 QUIC Stream 包装为 net.Conn 接口
+// StreamConn 将QUIC流包装为接口
 type StreamConn struct {
 	*quic.Stream
 	conn       *quic.Conn
@@ -82,7 +82,12 @@ func (s *StreamConn) SetDeadline(t time.Time) error {
 	return s.SetWriteDeadline(t)
 }
 
-// NewClientPool 创建新的客户端 QUIC 池
+// ConnectionState 返回TLS状态
+func (s *StreamConn) ConnectionState() tls.ConnectionState {
+	return (*s.conn).ConnectionState().TLS
+}
+
+// NewClientPool 创建新的客户端QUIC池
 func NewClientPool(
 	minCap, maxCap int,
 	minIvl, maxIvl time.Duration,
@@ -129,7 +134,7 @@ func NewClientPool(
 	return pool
 }
 
-// NewServerPool 创建新的服务端 QUIC 池
+// NewServerPool 创建新的服务端QUIC池
 func NewServerPool(
 	maxCap int,
 	clientIP string,
@@ -158,22 +163,28 @@ func NewServerPool(
 	return pool
 }
 
-// createStream 创建新的客户端 stream
+// createStream 创建新的客户端流
 func (p *Pool) createStream() bool {
 	conn := p.quicConn.Load()
 	if conn == nil {
 		return false
 	}
 
-	// 打开新的 stream
+	// 打开新的流
 	stream, err := conn.OpenStreamSync(p.ctx)
 	if err != nil {
 		return false
 	}
 
+	// 发送握手字节
+	if _, err := stream.Write([]byte{0x00}); err != nil {
+		stream.Close()
+		return false
+	}
+
 	var id string
 
-	// 接收 stream ID
+	// 接收流ID
 	stream.SetReadDeadline(time.Now().Add(idReadTimeout))
 	buf := make([]byte, 4)
 	n, err := io.ReadFull(stream, buf)
@@ -196,7 +207,7 @@ func (p *Pool) createStream() bool {
 	}
 }
 
-// handleStream 处理新的服务端 stream
+// handleStream 处理新的服务端流
 func (p *Pool) handleStream(stream *quic.Stream) {
 	var streamClosed bool
 	defer func() {
@@ -210,24 +221,30 @@ func (p *Pool) handleStream(stream *quic.Stream) {
 		return
 	}
 
-	// 生成 stream ID
+	// 读取握手字节
+	handshake := make([]byte, 1)
+	if _, err := io.ReadFull(stream, handshake); err != nil {
+		return
+	}
+
+	// 生成流ID
 	rawID := make([]byte, 4)
 	if _, err := rand.Read(rawID); err != nil {
 		return
 	}
 	id := hex.EncodeToString(rawID)
 
-	// 防止重复 stream ID
+	// 防止重复流ID
 	if _, exist := p.streams.Load(id); exist {
 		return
 	}
 
-	// 发送 ID 给客户端并在成功后建立映射
+	// 发送流ID给客户端
 	if _, err := stream.Write(rawID); err != nil {
 		return
 	}
 
-	// 尝试放入 idChan
+	// 尝试放入idChan
 	select {
 	case p.idChan <- id:
 		p.streams.Store(id, stream)
@@ -238,37 +255,34 @@ func (p *Pool) handleStream(stream *quic.Stream) {
 	}
 }
 
-// establishConnection 建立 QUIC 连接
+// establishConnection 建立QUIC连接
 func (p *Pool) establishConnection() error {
 	if p.quicConn.Load() != nil {
-		return nil // 已连接
+		return nil
 	}
 
-	// 配置 TLS
-	var tlsConf *tls.Config
+	// 配置TLS
+	var tlsConfig *tls.Config
 	switch p.tlsCode {
 	case "0", "1":
 		// 使用自签名证书（不验证）
-		tlsConf = &tls.Config{
+		tlsConfig = &tls.Config{
 			InsecureSkipVerify: true,
 			NextProtos:         []string{defaultALPN},
+			MinVersion:         tls.VersionTLS13,
 		}
 	case "2":
 		// 使用验证证书（安全模式）
-		tlsConf = &tls.Config{
+		tlsConfig = &tls.Config{
 			InsecureSkipVerify: false,
 			ServerName:         p.hostname,
 			NextProtos:         []string{defaultALPN},
-		}
-	default:
-		tlsConf = &tls.Config{
-			InsecureSkipVerify: true,
-			NextProtos:         []string{defaultALPN},
+			MinVersion:         tls.VersionTLS13,
 		}
 	}
 
-	// 建立 QUIC 连接
-	conn, err := quic.DialAddr(p.ctx, p.targetAddr, tlsConf, &quic.Config{
+	// 建立QUIC连接
+	conn, err := quic.DialAddr(p.ctx, p.targetAddr, tlsConfig, &quic.Config{
 		KeepAlivePeriod: p.keepAlive,
 		MaxIdleTimeout:  p.keepAlive * 3,
 	})
@@ -280,41 +294,42 @@ func (p *Pool) establishConnection() error {
 	return nil
 }
 
-// startListener 启动 QUIC 监听器
+// startListener 启动QUIC监听器
 func (p *Pool) startListener() error {
 	if p.quicListener.Load() != nil {
-		return nil // 已启动
+		return nil
 	}
 
-	// 配置 TLS
+	// 配置TLS
 	if p.tlsConfig == nil {
-		return fmt.Errorf("server mode requires TLS config")
+		return fmt.Errorf("startListener: server mode requires TLS config")
 	}
 
-	tlsConf := p.tlsConfig.Clone()
-	tlsConf.NextProtos = []string{defaultALPN}
+	tlsConfig := p.tlsConfig.Clone()
+	tlsConfig.NextProtos = []string{defaultALPN}
+	tlsConfig.MinVersion = tls.VersionTLS13
 
 	// 启动 QUIC 监听器
-	listener, err := quic.ListenAddr(p.listenAddr, tlsConf, &quic.Config{
+	listener, err := quic.ListenAddr(p.listenAddr, tlsConfig, &quic.Config{
 		KeepAlivePeriod: p.keepAlive,
 		MaxIdleTimeout:  p.keepAlive * 3,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("startListener: %w", err)
 	}
 
 	p.quicListener.Store(listener)
 	return nil
 }
 
-// ClientManager 客户端 QUIC 池管理器
+// ClientManager 客户端QUIC池管理器
 func (p *Pool) ClientManager() {
 	if p.cancel != nil {
 		p.cancel()
 	}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
-	// 建立 QUIC 连接
+	// 建立QUIC连接
 	for p.ctx.Err() == nil {
 		if err := p.establishConnection(); err == nil {
 			break
@@ -326,7 +341,7 @@ func (p *Pool) ClientManager() {
 		}
 	}
 
-	// 管理 stream 池
+	// 管理流创建
 	for p.ctx.Err() == nil {
 		p.adjustInterval()
 		capacity := int(p.capacity.Load())
@@ -360,19 +375,19 @@ func (p *Pool) ClientManager() {
 	}
 }
 
-// ServerManager 服务端 QUIC 池管理器
+// ServerManager 服务端QUIC池管理器
 func (p *Pool) ServerManager() {
 	if p.cancel != nil {
 		p.cancel()
 	}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
-	// 启动 QUIC 监听器
+	// 启动QUIC监听器
 	if err := p.startListener(); err != nil {
 		return
 	}
 
-	// 接受 QUIC 连接
+	// 接受QUIC连接
 	for p.ctx.Err() == nil {
 		listener := p.quicListener.Load()
 		if listener == nil {
@@ -392,7 +407,7 @@ func (p *Pool) ServerManager() {
 			continue
 		}
 
-		// 验证客户端 IP
+		// 验证客户端IP
 		if p.clientIP != "" {
 			remoteAddr := conn.RemoteAddr().(*net.UDPAddr)
 			if remoteAddr.IP.String() != p.clientIP {
@@ -401,10 +416,9 @@ func (p *Pool) ServerManager() {
 			}
 		}
 
-		// 存储连接并接受 streams
+		// 存储连接并接受流
 		p.quicConn.Store(conn)
 
-		// 在新 goroutine 中接受 streams
 		go func(conn *quic.Conn) {
 			for p.ctx.Err() == nil {
 				stream, err := conn.AcceptStream(p.ctx)
@@ -417,7 +431,7 @@ func (p *Pool) ServerManager() {
 	}
 }
 
-// OutgoingGet 根据 ID 获取可用 stream
+// OutgoingGet 根据ID获取可用流
 func (p *Pool) OutgoingGet(id string, timeout time.Duration) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(p.ctx, timeout)
 	defer cancel()
@@ -431,7 +445,6 @@ func (p *Pool) OutgoingGet(id string, timeout time.Duration) (net.Conn, error) {
 				return nil, fmt.Errorf("OutgoingGet: QUIC connection not available")
 			}
 
-			// 包装为 net.Conn
 			streamConn := &StreamConn{
 				Stream:     stream.(*quic.Stream),
 				conn:       conn,
@@ -449,7 +462,7 @@ func (p *Pool) OutgoingGet(id string, timeout time.Duration) (net.Conn, error) {
 	}
 }
 
-// IncomingGet 获取可用 stream 返回 ID
+// IncomingGet 获取可用流并返回ID
 func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
 	ctx, cancel := context.WithTimeout(p.ctx, timeout)
 	defer cancel()
@@ -465,7 +478,6 @@ func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
 					continue
 				}
 
-				// 包装为 net.Conn
 				streamConn := &StreamConn{
 					Stream:     stream.(*quic.Stream),
 					conn:       conn,
@@ -479,7 +491,7 @@ func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
 	}
 }
 
-// Flush 清空池中的所有 streams
+// Flush 清空池中的所有流
 func (p *Pool) Flush() {
 	var wg sync.WaitGroup
 	p.streams.Range(func(key, value any) bool {
@@ -517,7 +529,7 @@ func (p *Pool) Ready() bool {
 	return p.ctx != nil
 }
 
-// Active 获取当前活跃 stream 数
+// Active 获取当前活跃流数
 func (p *Pool) Active() int {
 	return len(p.idChan)
 }
@@ -527,7 +539,7 @@ func (p *Pool) Capacity() int {
 	return int(p.capacity.Load())
 }
 
-// Interval 获取当前 stream 创建间隔
+// Interval 获取当前流创建间隔
 func (p *Pool) Interval() time.Duration {
 	return time.Duration(p.interval.Load())
 }
@@ -547,7 +559,7 @@ func (p *Pool) ResetError() {
 	p.errCount.Store(0)
 }
 
-// adjustInterval 根据池使用情况动态调整 stream 创建间隔
+// adjustInterval 根据池使用情况动态调整流创建间隔
 func (p *Pool) adjustInterval() {
 	idle := len(p.idChan)
 	capacity := int(p.capacity.Load())

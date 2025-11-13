@@ -339,6 +339,11 @@ clientPool := quic.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "2", "example
 - **Error Handling:**
   - `AddError` and `ErrorCount` are thread-safe using atomic operations.
 
+- **ConnectionState Method:**
+  - Returns the TLS connection state from the underlying QUIC connection.
+  - Provides access to TLS handshake information and certificate details.
+  - Useful for debugging and verifying TLS configuration.
+
 ## Stream Multiplexing
 
 QUIC provides native stream multiplexing, allowing multiple logical streams over a single UDP connection:
