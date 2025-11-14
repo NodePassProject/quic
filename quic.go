@@ -35,26 +35,26 @@ const (
 
 // Pool QUIC连接池结构体，用于管理QUIC流
 type Pool struct {
-	streams      sync.Map                      // 存储流的映射表
-	idChan       chan string                   // 可用流ID通道
-	tlsCode      string                        // TLS安全模式代码
-	hostname     string                        // 主机名
-	clientIP     string                        // 客户端IP
-	tlsConfig    *tls.Config                   // TLS配置
-	targetAddr   string                        // 目标地址
-	listenAddr   string                        // 监听地址
-	errCount     atomic.Int32                  // 错误计数
-	capacity     atomic.Int32                  // 当前容量
-	minCap       int                           // 最小容量
-	maxCap       int                           // 最大容量
-	interval     atomic.Int64                  // 流创建间隔
-	minIvl       time.Duration                 // 最小间隔
-	maxIvl       time.Duration                 // 最大间隔
-	keepAlive    time.Duration                 // 保活间隔
-	ctx          context.Context               // 上下文
-	cancel       context.CancelFunc            // 取消函数
-	quicConn     atomic.Pointer[quic.Conn]     // QUIC连接
-	quicListener atomic.Pointer[quic.Listener] // QUIC监听器
+	streams      sync.Map                       // 存储流的映射表
+	idChan       chan string                    // 可用流ID通道
+	tlsCode      string                         // TLS安全模式代码
+	hostname     string                         // 主机名
+	clientIP     string                         // 客户端IP
+	tlsConfig    *tls.Config                    // TLS配置
+	targetAddr   string                         // 目标地址
+	listenAddr   string                         // 监听地址
+	errCount     atomic.Int32                   // 错误计数
+	capacity     atomic.Int32                   // 当前容量
+	minCap       int                            // 最小容量
+	maxCap       int                            // 最大容量
+	interval     atomic.Int64                   // 流创建间隔
+	minIvl       time.Duration                  // 最小间隔
+	maxIvl       time.Duration                  // 最大间隔
+	keepAlive    time.Duration                  // 保活间隔
+	ctx          context.Context                // 上下文
+	cancel       context.CancelFunc             // 取消函数
+	quicConn     atomic.Pointer[*quic.Conn]     // QUIC连接
+	quicListener atomic.Pointer[*quic.Listener] // QUIC监听器
 }
 
 // StreamConn 将QUIC流包装为接口
@@ -77,15 +77,15 @@ func (s *StreamConn) RemoteAddr() net.Addr {
 
 // SetDeadline 设置读写截止时间
 func (s *StreamConn) SetDeadline(t time.Time) error {
-	if err := s.SetReadDeadline(t); err != nil {
+	if err := s.Stream.SetReadDeadline(t); err != nil {
 		return err
 	}
-	return s.SetWriteDeadline(t)
+	return s.Stream.SetWriteDeadline(t)
 }
 
 // ConnectionState 返回TLS状态
 func (s *StreamConn) ConnectionState() tls.ConnectionState {
-	return (*s.conn).ConnectionState().TLS
+	return s.conn.ConnectionState().TLS
 }
 
 // NewClientPool 创建新的客户端QUIC池
@@ -167,19 +167,21 @@ func NewServerPool(
 // createStream 创建新的客户端流
 func (p *Pool) createStream() bool {
 	conn := p.quicConn.Load()
-	if conn == nil {
+	if conn == nil || *conn == nil {
 		return false
 	}
 
 	// 打开新的流
-	stream, err := conn.OpenStreamSync(p.ctx)
+	stream, err := (*conn).OpenStreamSync(p.ctx)
 	if err != nil {
+		p.quicConn.Store(nil)
 		return false
 	}
 
 	// 发送握手字节
 	if _, err := stream.Write([]byte{0x00}); err != nil {
 		stream.Close()
+		p.quicConn.Store(nil)
 		return false
 	}
 
@@ -191,6 +193,7 @@ func (p *Pool) createStream() bool {
 	n, err := io.ReadFull(stream, buf)
 	if err != nil || n != 4 {
 		stream.Close()
+		p.quicConn.Store(nil)
 		return false
 	}
 	id = hex.EncodeToString(buf)
@@ -224,7 +227,7 @@ func (p *Pool) handleStream(stream *quic.Stream) {
 
 	// 读取握手字节
 	handshake := make([]byte, 1)
-	if _, err := io.ReadFull(stream, handshake); err != nil {
+	if _, err := stream.Read(handshake); err != nil {
 		return
 	}
 
@@ -258,8 +261,12 @@ func (p *Pool) handleStream(stream *quic.Stream) {
 
 // establishConnection 建立QUIC连接
 func (p *Pool) establishConnection() error {
-	if p.quicConn.Load() != nil {
-		return nil
+	conn := p.quicConn.Load()
+	if conn != nil && *conn != nil {
+		if (*conn).Context().Err() == nil {
+			return nil
+		}
+		p.quicConn.Store(nil)
 	}
 
 	// 配置TLS
@@ -283,7 +290,7 @@ func (p *Pool) establishConnection() error {
 	}
 
 	// 建立QUIC连接
-	conn, err := quic.DialAddr(p.ctx, p.targetAddr, tlsConfig, &quic.Config{
+	newConn, err := quic.DialAddr(p.ctx, p.targetAddr, tlsConfig, &quic.Config{
 		KeepAlivePeriod:    p.keepAlive,
 		MaxIdleTimeout:     p.keepAlive * 3,
 		MaxIncomingStreams: int64(p.maxCap),
@@ -292,13 +299,14 @@ func (p *Pool) establishConnection() error {
 		return err
 	}
 
-	p.quicConn.Store(conn)
+	p.quicConn.Store(&newConn)
 	return nil
 }
 
 // startListener 启动QUIC监听器
 func (p *Pool) startListener() error {
-	if p.quicListener.Load() != nil {
+	listener := p.quicListener.Load()
+	if listener != nil && *listener != nil {
 		return nil
 	}
 
@@ -312,7 +320,7 @@ func (p *Pool) startListener() error {
 	tlsConfig.MinVersion = tls.VersionTLS13
 
 	// 启动 QUIC 监听器
-	listener, err := quic.ListenAddr(p.listenAddr, tlsConfig, &quic.Config{
+	newListener, err := quic.ListenAddr(p.listenAddr, tlsConfig, &quic.Config{
 		KeepAlivePeriod:    p.keepAlive,
 		MaxIdleTimeout:     p.keepAlive * 3,
 		MaxIncomingStreams: int64(p.maxCap),
@@ -321,7 +329,7 @@ func (p *Pool) startListener() error {
 		return fmt.Errorf("startListener: %w", err)
 	}
 
-	p.quicListener.Store(listener)
+	p.quicListener.Store(&newListener)
 	return nil
 }
 
@@ -335,10 +343,7 @@ func (p *Pool) ClientManager() {
 	// 管理流创建
 	for p.ctx.Err() == nil {
 		conn := p.quicConn.Load()
-		if conn == nil || (*conn).Context().Err() != nil {
-			if conn != nil {
-				p.quicConn.Store(nil)
-			}
+		if conn == nil || *conn == nil || (*conn).Context().Err() != nil {
 			if err := p.establishConnection(); err != nil {
 				select {
 				case <-p.ctx.Done():
@@ -396,11 +401,11 @@ func (p *Pool) ServerManager() {
 	// 接受QUIC连接
 	for p.ctx.Err() == nil {
 		listener := p.quicListener.Load()
-		if listener == nil {
+		if listener == nil || *listener == nil {
 			return
 		}
 
-		conn, err := listener.Accept(p.ctx)
+		conn, err := (*listener).Accept(p.ctx)
 		if err != nil {
 			if p.ctx.Err() != nil {
 				return
@@ -423,11 +428,11 @@ func (p *Pool) ServerManager() {
 		}
 
 		// 存储连接并接受流
-		p.quicConn.Store(conn)
+		p.quicConn.Store(&conn)
 
-		go func(conn *quic.Conn) {
+		go func(c *quic.Conn) {
 			for p.ctx.Err() == nil {
-				stream, err := conn.AcceptStream(p.ctx)
+				stream, err := c.AcceptStream(p.ctx)
 				if err != nil {
 					return
 				}
@@ -447,15 +452,15 @@ func (p *Pool) OutgoingGet(id string, timeout time.Duration) (net.Conn, error) {
 			<-p.idChan
 
 			conn := p.quicConn.Load()
-			if conn == nil {
+			if conn == nil || *conn == nil {
 				return nil, fmt.Errorf("OutgoingGet: QUIC connection not available")
 			}
 
 			streamConn := &StreamConn{
 				Stream:     stream.(*quic.Stream),
-				conn:       conn,
-				localAddr:  conn.LocalAddr(),
-				remoteAddr: conn.RemoteAddr(),
+				conn:       *conn,
+				localAddr:  (*conn).LocalAddr(),
+				remoteAddr: (*conn).RemoteAddr(),
 			}
 			return streamConn, nil
 		}
@@ -480,15 +485,15 @@ func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
 		case id := <-p.idChan:
 			if stream, ok := p.streams.LoadAndDelete(id); ok {
 				conn := p.quicConn.Load()
-				if conn == nil {
+				if conn == nil || *conn == nil {
 					continue
 				}
 
 				streamConn := &StreamConn{
 					Stream:     stream.(*quic.Stream),
-					conn:       conn,
-					localAddr:  conn.LocalAddr(),
-					remoteAddr: conn.RemoteAddr(),
+					conn:       *conn,
+					localAddr:  (*conn).LocalAddr(),
+					remoteAddr: (*conn).RemoteAddr(),
 				}
 				return id, streamConn, nil
 			}
@@ -521,12 +526,12 @@ func (p *Pool) Close() {
 	}
 	p.Flush()
 
-	if conn := p.quicConn.Swap(nil); conn != nil {
-		conn.CloseWithError(0, "pool closed")
+	if conn := p.quicConn.Swap(nil); conn != nil && *conn != nil {
+		(*conn).CloseWithError(0, "pool closed")
 	}
 
-	if listener := p.quicListener.Swap(nil); listener != nil {
-		listener.Close()
+	if listener := p.quicListener.Swap(nil); listener != nil && *listener != nil {
+		(*listener).Close()
 	}
 }
 
