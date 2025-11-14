@@ -24,6 +24,7 @@ const (
 	idReadTimeout           = 1 * time.Minute
 	idRetryInterval         = 50 * time.Millisecond
 	acceptRetryInterval     = 50 * time.Millisecond
+	reconnectRetryInterval  = 500 * time.Millisecond
 	intervalAdjustStep      = 100 * time.Millisecond
 	capacityAdjustLowRatio  = 0.2
 	capacityAdjustHighRatio = 0.8
@@ -283,8 +284,9 @@ func (p *Pool) establishConnection() error {
 
 	// 建立QUIC连接
 	conn, err := quic.DialAddr(p.ctx, p.targetAddr, tlsConfig, &quic.Config{
-		KeepAlivePeriod: p.keepAlive,
-		MaxIdleTimeout:  p.keepAlive * 3,
+		KeepAlivePeriod:    p.keepAlive,
+		MaxIdleTimeout:     p.keepAlive * 3,
+		MaxIncomingStreams: int64(p.maxCap),
 	})
 	if err != nil {
 		return err
@@ -311,8 +313,9 @@ func (p *Pool) startListener() error {
 
 	// 启动 QUIC 监听器
 	listener, err := quic.ListenAddr(p.listenAddr, tlsConfig, &quic.Config{
-		KeepAlivePeriod: p.keepAlive,
-		MaxIdleTimeout:  p.keepAlive * 3,
+		KeepAlivePeriod:    p.keepAlive,
+		MaxIdleTimeout:     p.keepAlive * 3,
+		MaxIncomingStreams: int64(p.maxCap),
 	})
 	if err != nil {
 		return fmt.Errorf("startListener: %w", err)
@@ -329,20 +332,23 @@ func (p *Pool) ClientManager() {
 	}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
-	// 建立QUIC连接
-	for p.ctx.Err() == nil {
-		if err := p.establishConnection(); err == nil {
-			break
-		}
-		select {
-		case <-p.ctx.Done():
-			return
-		case <-time.After(time.Second):
-		}
-	}
-
 	// 管理流创建
 	for p.ctx.Err() == nil {
+		conn := p.quicConn.Load()
+		if conn == nil || (*conn).Context().Err() != nil {
+			if conn != nil {
+				p.quicConn.Store(nil)
+			}
+			if err := p.establishConnection(); err != nil {
+				select {
+				case <-p.ctx.Done():
+					return
+				case <-time.After(reconnectRetryInterval):
+				}
+				continue
+			}
+		}
+
 		p.adjustInterval()
 		capacity := int(p.capacity.Load())
 		need := capacity - len(p.idChan)
