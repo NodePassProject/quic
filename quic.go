@@ -31,30 +31,42 @@ const (
 	intervalLowThreshold    = 0.2
 	intervalHighThreshold   = 0.8
 	defaultALPN             = "np-quic"
+	defaultStreamsPerConn   = 128
+	minConnsPerPool         = 1
+	maxConnsPerPool         = 32
 )
+
+// Shard 连接分片，封装单个QUIC连接及其流管理
+type Shard struct {
+	streams      sync.Map                      // 存储流的映射表
+	idChan       chan string                   // 可用流ID通道
+	quicConn     atomic.Pointer[quic.Conn]     // QUIC连接
+	quicListener atomic.Pointer[quic.Listener] // QUIC监听器
+	index        int                           // 分片索引
+	maxStreams   int                           // 此分片的最大流数
+}
 
 // Pool QUIC连接池结构体，用于管理QUIC流
 type Pool struct {
-	streams      sync.Map                       // 存储流的映射表
-	idChan       chan string                    // 可用流ID通道
-	tlsCode      string                         // TLS安全模式代码
-	hostname     string                         // 主机名
-	clientIP     string                         // 客户端IP
-	tlsConfig    *tls.Config                    // TLS配置
-	targetAddr   string                         // 目标地址
-	listenAddr   string                         // 监听地址
-	errCount     atomic.Int32                   // 错误计数
-	capacity     atomic.Int32                   // 当前容量
-	minCap       int                            // 最小容量
-	maxCap       int                            // 最大容量
-	interval     atomic.Int64                   // 流创建间隔
-	minIvl       time.Duration                  // 最小间隔
-	maxIvl       time.Duration                  // 最大间隔
-	keepAlive    time.Duration                  // 保活间隔
-	ctx          context.Context                // 上下文
-	cancel       context.CancelFunc             // 取消函数
-	quicConn     atomic.Pointer[*quic.Conn]     // QUIC连接
-	quicListener atomic.Pointer[*quic.Listener] // QUIC监听器
+	shards     []*Shard           // 连接分片切片
+	numShards  int                // 分片数量
+	idChan     chan string        // 全局可用流ID通道
+	tlsCode    string             // TLS安全模式代码
+	hostname   string             // 主机名
+	clientIP   string             // 客户端IP
+	tlsConfig  *tls.Config        // TLS配置
+	targetAddr string             // 目标地址
+	listenAddr string             // 监听地址
+	errCount   atomic.Int32       // 错误计数
+	capacity   atomic.Int32       // 当前容量
+	minCap     int                // 最小容量
+	maxCap     int                // 最大容量
+	interval   atomic.Int64       // 流创建间隔
+	minIvl     time.Duration      // 最小间隔
+	maxIvl     time.Duration      // 最大间隔
+	keepAlive  time.Duration      // 保活间隔
+	ctx        context.Context    // 上下文
+	cancel     context.CancelFunc // 取消函数
 }
 
 // StreamConn 将QUIC流包装为接口
@@ -88,15 +100,8 @@ func (s *StreamConn) ConnectionState() tls.ConnectionState {
 	return s.conn.ConnectionState().TLS
 }
 
-// NewClientPool 创建新的客户端QUIC池
-func NewClientPool(
-	minCap, maxCap int,
-	minIvl, maxIvl time.Duration,
-	keepAlive time.Duration,
-	tlsCode string,
-	hostname string,
-	targetAddr string,
-) *Pool {
+// validateCapacity 验证并规范化容量参数
+func validateCapacity(minCap, maxCap int) (int, int) {
 	if minCap <= 0 {
 		minCap = defaultMinCap
 	}
@@ -106,7 +111,11 @@ func NewClientPool(
 	if minCap > maxCap {
 		minCap, maxCap = maxCap, minCap
 	}
+	return minCap, maxCap
+}
 
+// validateInterval 验证并规范化间隔参数
+func validateInterval(minIvl, maxIvl time.Duration) (time.Duration, time.Duration) {
 	if minIvl <= 0 {
 		minIvl = defaultMinIvl
 	}
@@ -116,9 +125,129 @@ func NewClientPool(
 	if minIvl > maxIvl {
 		minIvl, maxIvl = maxIvl, minIvl
 	}
+	return minIvl, maxIvl
+}
+
+// calculateShardCount 计算所需的分片数量
+func calculateShardCount(maxCap int) int {
+	numShards := min(max((maxCap+defaultStreamsPerConn-1)/defaultStreamsPerConn, minConnsPerPool), maxConnsPerPool)
+	return numShards
+}
+
+// createShards 创建并初始化分片切片
+func createShards(numShards int) []*Shard {
+	shards := make([]*Shard, numShards)
+	for i := range shards {
+		shards[i] = &Shard{
+			streams:    sync.Map{},
+			idChan:     make(chan string, defaultStreamsPerConn),
+			index:      i,
+			maxStreams: defaultStreamsPerConn,
+		}
+	}
+	return shards
+}
+
+// buildTLSConfig 构建TLS配置
+func buildTLSConfig(tlsCode, hostname string) *tls.Config {
+	var tlsConfig *tls.Config
+	switch tlsCode {
+	case "0", "1":
+		// 使用自签名证书（不验证）
+		tlsConfig = &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{defaultALPN},
+			MinVersion:         tls.VersionTLS13,
+		}
+	case "2":
+		// 使用验证证书（安全模式）
+		tlsConfig = &tls.Config{
+			InsecureSkipVerify: false,
+			ServerName:         hostname,
+			NextProtos:         []string{defaultALPN},
+			MinVersion:         tls.VersionTLS13,
+		}
+	}
+	return tlsConfig
+}
+
+// buildQUICConfig 构建QUIC配置
+func buildQUICConfig(keepAlive time.Duration) *quic.Config {
+	return &quic.Config{
+		KeepAlivePeriod:    keepAlive,
+		MaxIdleTimeout:     keepAlive * 3,
+		MaxIncomingStreams: int64(defaultStreamsPerConn),
+	}
+}
+
+// createStreamConn 从分片中创建StreamConn
+func createStreamConn(shard *Shard, stream any) (*StreamConn, bool) {
+	conn := shard.quicConn.Load()
+	if conn == nil {
+		return nil, false
+	}
+	return &StreamConn{
+		Stream:     stream.(*quic.Stream),
+		conn:       conn,
+		localAddr:  conn.LocalAddr(),
+		remoteAddr: conn.RemoteAddr(),
+	}, true
+}
+
+// findStreamInShards 在所有分片中查找并删除流
+func (p *Pool) findStreamInShards(id string, consumeShardChan bool) (*StreamConn, bool) {
+	for _, shard := range p.shards {
+		if stream, ok := shard.streams.LoadAndDelete(id); ok {
+			if consumeShardChan {
+				<-shard.idChan
+			}
+			if streamConn, ok := createStreamConn(shard, stream); ok {
+				return streamConn, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// flushShard 清空分片中的所有流
+func (s *Shard) flushShard() {
+	s.streams.Range(func(key, value any) bool {
+		if stream, ok := value.(*quic.Stream); ok {
+			stream.Close()
+		}
+		return true
+	})
+	s.streams = sync.Map{}
+	s.idChan = make(chan string, s.maxStreams)
+}
+
+// closeShard 关闭分片的连接和监听器
+func (s *Shard) closeShard() {
+	if conn := s.quicConn.Swap(nil); conn != nil {
+		conn.CloseWithError(0, "pool closed")
+	}
+	if listener := s.quicListener.Swap(nil); listener != nil {
+		listener.Close()
+	}
+}
+
+// NewClientPool 创建新的客户端QUIC池
+func NewClientPool(
+	minCap, maxCap int,
+	minIvl, maxIvl time.Duration,
+	keepAlive time.Duration,
+	tlsCode string,
+	hostname string,
+	targetAddr string,
+) *Pool {
+	minCap, maxCap = validateCapacity(minCap, maxCap)
+	minIvl, maxIvl = validateInterval(minIvl, maxIvl)
+	numShards := calculateShardCount(maxCap)
+	shards := createShards(numShards)
 
 	pool := &Pool{
-		streams:    sync.Map{},
+		shards:     shards,
+		numShards:  numShards,
 		idChan:     make(chan string, maxCap),
 		tlsCode:    tlsCode,
 		hostname:   hostname,
@@ -146,13 +275,16 @@ func NewServerPool(
 	if maxCap <= 0 {
 		maxCap = defaultMaxCap
 	}
-
 	if listenAddr == "" {
 		return nil
 	}
 
+	numShards := calculateShardCount(maxCap)
+	shards := createShards(numShards)
+
 	pool := &Pool{
-		streams:    sync.Map{},
+		shards:     shards,
+		numShards:  numShards,
 		idChan:     make(chan string, maxCap),
 		clientIP:   clientIP,
 		tlsConfig:  tlsConfig,
@@ -164,24 +296,24 @@ func NewServerPool(
 	return pool
 }
 
-// createStream 创建新的客户端流
-func (p *Pool) createStream() bool {
-	conn := p.quicConn.Load()
-	if conn == nil || *conn == nil {
+// createStream 在指定分片上创建新的客户端流
+func (s *Shard) createStream(ctx context.Context, globalChan chan string) bool {
+	conn := s.quicConn.Load()
+	if conn == nil {
 		return false
 	}
 
 	// 打开新的流
-	stream, err := (*conn).OpenStreamSync(p.ctx)
+	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		p.quicConn.Store(nil)
+		s.quicConn.Store(nil)
 		return false
 	}
 
 	// 发送握手字节
 	if _, err := stream.Write([]byte{0x00}); err != nil {
 		stream.Close()
-		p.quicConn.Store(nil)
+		s.quicConn.Store(nil)
 		return false
 	}
 
@@ -193,41 +325,51 @@ func (p *Pool) createStream() bool {
 	n, err := io.ReadFull(stream, buf)
 	if err != nil || n != 4 {
 		stream.Close()
-		p.quicConn.Store(nil)
+		s.quicConn.Store(nil)
 		return false
 	}
 	id = hex.EncodeToString(buf)
 	stream.SetReadDeadline(time.Time{})
 
-	// 建立映射并存入通道
-	p.streams.Store(id, stream)
+	// 建立映射并存入分片通道和全局通道
+	s.streams.Store(id, stream)
 	select {
-	case p.idChan <- id:
-		return true
+	case s.idChan <- id:
+		// 同时尝试放入全局通道
+		select {
+		case globalChan <- id:
+			return true
+		default:
+			// 全局通道满
+			<-s.idChan
+			s.streams.Delete(id)
+			stream.Close()
+			return false
+		}
 	default:
-		p.streams.Delete(id)
+		s.streams.Delete(id)
 		stream.Close()
 		return false
 	}
 }
 
 // handleStream 处理新的服务端流
-func (p *Pool) handleStream(stream *quic.Stream) {
+func (s *Shard) handleStream(stream *quic.Stream, globalChan chan string, maxCap int, globalActive func() int) {
 	var streamClosed bool
 	defer func() {
 		if !streamClosed {
-			stream.Close()
+			(*stream).Close()
 		}
 	}()
 
-	// 检查池是否已满
-	if p.Active() >= p.maxCap {
+	// 检查全局池是否已满
+	if globalActive() >= maxCap {
 		return
 	}
 
 	// 读取握手字节
 	handshake := make([]byte, 1)
-	if _, err := stream.Read(handshake); err != nil {
+	if _, err := (*stream).Read(handshake); err != nil {
 		return
 	}
 
@@ -239,97 +381,73 @@ func (p *Pool) handleStream(stream *quic.Stream) {
 	id := hex.EncodeToString(rawID)
 
 	// 防止重复流ID
-	if _, exist := p.streams.Load(id); exist {
+	if _, exist := s.streams.Load(id); exist {
 		return
 	}
 
 	// 发送流ID给客户端
-	if _, err := stream.Write(rawID); err != nil {
+	if _, err := (*stream).Write(rawID); err != nil {
 		return
 	}
 
-	// 尝试放入idChan
+	// 尝试放入分片通道和全局通道
 	select {
-	case p.idChan <- id:
-		p.streams.Store(id, stream)
-		streamClosed = true
+	case s.idChan <- id:
+		select {
+		case globalChan <- id:
+			s.streams.Store(id, &stream)
+			streamClosed = true
+		default:
+			<-s.idChan
+			return
+		}
 	default:
-		// 池满
 		return
 	}
 }
 
-// establishConnection 建立QUIC连接
-func (p *Pool) establishConnection() error {
-	conn := p.quicConn.Load()
-	if conn != nil && *conn != nil {
-		if (*conn).Context().Err() == nil {
+// establishConnection 为分片建立QUIC连接
+func (s *Shard) establishConnection(ctx context.Context, targetAddr, tlsCode, hostname string, keepAlive time.Duration) error {
+	conn := s.quicConn.Load()
+	if conn != nil {
+		if conn.Context().Err() == nil {
 			return nil
 		}
-		p.quicConn.Store(nil)
+		s.quicConn.Store(nil)
 	}
 
-	// 配置TLS
-	var tlsConfig *tls.Config
-	switch p.tlsCode {
-	case "0", "1":
-		// 使用自签名证书（不验证）
-		tlsConfig = &tls.Config{
-			InsecureSkipVerify: true,
-			NextProtos:         []string{defaultALPN},
-			MinVersion:         tls.VersionTLS13,
-		}
-	case "2":
-		// 使用验证证书（安全模式）
-		tlsConfig = &tls.Config{
-			InsecureSkipVerify: false,
-			ServerName:         p.hostname,
-			NextProtos:         []string{defaultALPN},
-			MinVersion:         tls.VersionTLS13,
-		}
-	}
+	tlsConfig := buildTLSConfig(tlsCode, hostname)
+	quicConfig := buildQUICConfig(keepAlive)
 
-	// 建立QUIC连接
-	newConn, err := quic.DialAddr(p.ctx, p.targetAddr, tlsConfig, &quic.Config{
-		KeepAlivePeriod:    p.keepAlive,
-		MaxIdleTimeout:     p.keepAlive * 3,
-		MaxIncomingStreams: int64(p.maxCap),
-	})
+	newConn, err := quic.DialAddr(ctx, targetAddr, tlsConfig, quicConfig)
 	if err != nil {
 		return err
 	}
 
-	p.quicConn.Store(&newConn)
+	s.quicConn.Store(newConn)
 	return nil
 }
 
-// startListener 启动QUIC监听器
-func (p *Pool) startListener() error {
-	listener := p.quicListener.Load()
-	if listener != nil && *listener != nil {
+// startListener 为分片启动QUIC监听器
+func (s *Shard) startListener(listenAddr string, tlsConfig *tls.Config, keepAlive time.Duration) error {
+	if s.quicListener.Load() != nil {
 		return nil
 	}
-
-	// 配置TLS
-	if p.tlsConfig == nil {
+	if tlsConfig == nil {
 		return fmt.Errorf("startListener: server mode requires TLS config")
 	}
 
-	tlsConfig := p.tlsConfig.Clone()
-	tlsConfig.NextProtos = []string{defaultALPN}
-	tlsConfig.MinVersion = tls.VersionTLS13
+	clonedTLS := tlsConfig.Clone()
+	clonedTLS.NextProtos = []string{defaultALPN}
+	clonedTLS.MinVersion = tls.VersionTLS13
 
-	// 启动 QUIC 监听器
-	newListener, err := quic.ListenAddr(p.listenAddr, tlsConfig, &quic.Config{
-		KeepAlivePeriod:    p.keepAlive,
-		MaxIdleTimeout:     p.keepAlive * 3,
-		MaxIncomingStreams: int64(p.maxCap),
-	})
+	quicConfig := buildQUICConfig(keepAlive)
+	newListener, err := quic.ListenAddr(listenAddr, clonedTLS, quicConfig)
 	if err != nil {
-		return fmt.Errorf("startListener: %w", err)
+		return fmt.Errorf("startListener[shard %d]: %w", s.index, err)
 	}
 
-	p.quicListener.Store(&newListener)
+	s.quicListener.Store(newListener)
 	return nil
 }
 
@@ -340,36 +458,48 @@ func (p *Pool) ClientManager() {
 	}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
-	// 管理流创建
+	var wg sync.WaitGroup
+	for i := range p.shards {
+		wg.Add(1)
+		go func(shard *Shard) {
+			defer wg.Done()
+			p.manageShardClient(shard)
+		}(p.shards[i])
+	}
+	wg.Wait()
+}
+
+// manageShardClient 管理单个分片的客户端流创建
+func (p *Pool) manageShardClient(shard *Shard) {
 	for p.ctx.Err() == nil {
-		conn := p.quicConn.Load()
-		if conn == nil || *conn == nil || (*conn).Context().Err() != nil {
-			if err := p.establishConnection(); err != nil {
-				select {
-				case <-p.ctx.Done():
-					return
-				case <-time.After(reconnectRetryInterval):
-				}
-				continue
+		// 确保分片连接已建立
+		if err := shard.establishConnection(p.ctx, p.targetAddr, p.tlsCode, p.hostname, p.keepAlive); err != nil {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-time.After(reconnectRetryInterval):
 			}
+			continue
 		}
 
 		p.adjustInterval()
 		capacity := int(p.capacity.Load())
-		need := capacity - len(p.idChan)
+		// 计算分片所需容量并创建流
+		shardCapacity := (capacity + p.numShards - 1) / p.numShards
+		need := shardCapacity - len(shard.idChan)
 		created := 0
 
 		if need > 0 {
-			var wg sync.WaitGroup
+			var shardWg sync.WaitGroup
 			results := make(chan int, need)
 			for range need {
-				wg.Go(func() {
-					if p.createStream() {
+				shardWg.Go(func() {
+					if shard.createStream(p.ctx, p.idChan) {
 						results <- 1
 					}
 				})
 			}
-			wg.Wait()
+			shardWg.Wait()
 			close(results)
 			for r := range results {
 				created += r
@@ -393,19 +523,33 @@ func (p *Pool) ServerManager() {
 	}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
-	// 启动QUIC监听器
-	if err := p.startListener(); err != nil {
+	// 为每个分片启动独立的监听器
+	var wg sync.WaitGroup
+	for i := range p.shards {
+		wg.Add(1)
+		go func(shard *Shard) {
+			defer wg.Done()
+			p.manageShardServer(shard)
+		}(p.shards[i])
+	}
+	wg.Wait()
+}
+
+// manageShardServer 管理单个分片的服务端监听和流接收
+func (p *Pool) manageShardServer(shard *Shard) {
+	// 启动分片的QUIC监听器
+	if err := shard.startListener(p.listenAddr, p.tlsConfig, p.keepAlive); err != nil {
 		return
 	}
 
 	// 接受QUIC连接
 	for p.ctx.Err() == nil {
-		listener := p.quicListener.Load()
-		if listener == nil || *listener == nil {
+		listener := shard.quicListener.Load()
+		if listener == nil {
 			return
 		}
 
-		conn, err := (*listener).Accept(p.ctx)
+		conn, err := listener.Accept(p.ctx)
 		if err != nil {
 			if p.ctx.Err() != nil {
 				return
@@ -428,15 +572,15 @@ func (p *Pool) ServerManager() {
 		}
 
 		// 存储连接并接受流
-		p.quicConn.Store(&conn)
+		shard.quicConn.Store(conn)
 
 		go func(c *quic.Conn) {
 			for p.ctx.Err() == nil {
-				stream, err := c.AcceptStream(p.ctx)
+				stream, err := (*c).AcceptStream(p.ctx)
 				if err != nil {
 					return
 				}
-				go p.handleStream(stream)
+				go shard.handleStream(stream, p.idChan, p.maxCap, p.Active)
 			}
 		}(conn)
 	}
@@ -448,20 +592,8 @@ func (p *Pool) OutgoingGet(id string, timeout time.Duration) (net.Conn, error) {
 	defer cancel()
 
 	for {
-		if stream, ok := p.streams.LoadAndDelete(id); ok {
+		if streamConn, ok := p.findStreamInShards(id, true); ok {
 			<-p.idChan
-
-			conn := p.quicConn.Load()
-			if conn == nil || *conn == nil {
-				return nil, fmt.Errorf("OutgoingGet: QUIC connection not available")
-			}
-
-			streamConn := &StreamConn{
-				Stream:     stream.(*quic.Stream),
-				conn:       *conn,
-				localAddr:  (*conn).LocalAddr(),
-				remoteAddr: (*conn).RemoteAddr(),
-			}
 			return streamConn, nil
 		}
 
@@ -483,18 +615,7 @@ func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
 		case <-ctx.Done():
 			return "", nil, fmt.Errorf("IncomingGet: insufficient streams")
 		case id := <-p.idChan:
-			if stream, ok := p.streams.LoadAndDelete(id); ok {
-				conn := p.quicConn.Load()
-				if conn == nil || *conn == nil {
-					continue
-				}
-
-				streamConn := &StreamConn{
-					Stream:     stream.(*quic.Stream),
-					conn:       *conn,
-					localAddr:  (*conn).LocalAddr(),
-					remoteAddr: (*conn).RemoteAddr(),
-				}
+			if streamConn, ok := p.findStreamInShards(id, true); ok {
 				return id, streamConn, nil
 			}
 			continue
@@ -505,17 +626,16 @@ func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
 // Flush 清空池中的所有流
 func (p *Pool) Flush() {
 	var wg sync.WaitGroup
-	p.streams.Range(func(key, value any) bool {
-		wg.Go(func() {
-			if stream, ok := value.(*quic.Stream); ok {
-				stream.Close()
-			}
-		})
-		return true
-	})
+	for _, shard := range p.shards {
+		wg.Add(1)
+		go func(s *Shard) {
+			defer wg.Done()
+			s.flushShard()
+		}(shard)
+	}
 	wg.Wait()
 
-	p.streams = sync.Map{}
+	// 重建全局通道
 	p.idChan = make(chan string, p.maxCap)
 }
 
@@ -526,16 +646,17 @@ func (p *Pool) Close() {
 	}
 	p.Flush()
 
-	if conn := p.quicConn.Swap(nil); conn != nil && *conn != nil {
-		(*conn).CloseWithError(0, "pool closed")
+	// 并行关闭所有分片的连接和监听器
+	var wg sync.WaitGroup
+	for _, shard := range p.shards {
+		wg.Add(1)
+		go func(s *Shard) {
+			defer wg.Done()
+			s.closeShard()
+		}(shard)
 	}
-
-	if listener := p.quicListener.Swap(nil); listener != nil && *listener != nil {
-		(*listener).Close()
-	}
-}
-
-// Ready 检查连接池是否已初始化
+	wg.Wait()
+} // Ready 检查连接池是否已初始化
 func (p *Pool) Ready() bool {
 	return p.ctx != nil
 }
@@ -543,6 +664,11 @@ func (p *Pool) Ready() bool {
 // Active 获取当前活跃流数
 func (p *Pool) Active() int {
 	return len(p.idChan)
+}
+
+// ShardCount 获取连接分片数量
+func (p *Pool) ShardCount() int {
+	return p.numShards
 }
 
 // Capacity 获取当前池容量
