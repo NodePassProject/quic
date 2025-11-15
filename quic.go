@@ -395,7 +395,7 @@ func (s *Shard) handleStream(stream *quic.Stream, globalChan chan string, maxCap
 	case s.idChan <- id:
 		select {
 		case globalChan <- id:
-			s.streams.Store(id, &stream)
+			s.streams.Store(id, stream)
 			streamClosed = true
 		default:
 			<-s.idChan
