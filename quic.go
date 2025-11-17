@@ -33,7 +33,7 @@ const (
 	defaultALPN             = "np-quic"
 	defaultStreamsPerConn   = 128
 	minConnsPerPool         = 1
-	maxConnsPerPool         = 32
+	maxConnsPerPool         = 64
 )
 
 // Shard 连接分片，封装单个QUIC连接及其流管理
