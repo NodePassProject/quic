@@ -160,8 +160,6 @@ The error indicates if the stream with the specified ID was not found or if the 
 
 ### Server Stream Pool
 
-### Server Stream Pool
-
 ```go
 package main
 
