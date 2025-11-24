@@ -48,25 +48,25 @@ type Shard struct {
 
 // Pool QUIC连接池结构体，用于管理QUIC流
 type Pool struct {
-	shards     []*Shard           // 连接分片切片
-	numShards  int                // 分片数量
-	idChan     chan string        // 全局可用流ID通道
-	tlsCode    string             // TLS安全模式代码
-	hostname   string             // 主机名
-	clientIP   string             // 客户端IP
-	tlsConfig  *tls.Config        // TLS配置
-	targetAddr string             // 目标地址
-	listenAddr string             // 监听地址
-	errCount   atomic.Int32       // 错误计数
-	capacity   atomic.Int32       // 当前容量
-	minCap     int                // 最小容量
-	maxCap     int                // 最大容量
-	interval   atomic.Int64       // 流创建间隔
-	minIvl     time.Duration      // 最小间隔
-	maxIvl     time.Duration      // 最大间隔
-	keepAlive  time.Duration      // 保活间隔
-	ctx        context.Context    // 上下文
-	cancel     context.CancelFunc // 取消函数
+	shards       []*Shard               // 连接分片切片
+	numShards    int                    // 分片数量
+	idChan       chan string            // 全局可用流ID通道
+	tlsCode      string                 // TLS安全模式代码
+	hostname     string                 // 主机名
+	clientIP     string                 // 客户端IP
+	tlsConfig    *tls.Config            // TLS配置
+	addrResolver func() (string, error) // 地址解析器
+	listenAddr   string                 // 监听地址
+	errCount     atomic.Int32           // 错误计数
+	capacity     atomic.Int32           // 当前容量
+	minCap       int                    // 最小容量
+	maxCap       int                    // 最大容量
+	interval     atomic.Int64           // 流创建间隔
+	minIvl       time.Duration          // 最小间隔
+	maxIvl       time.Duration          // 最大间隔
+	keepAlive    time.Duration          // 保活间隔
+	ctx          context.Context        // 上下文
+	cancel       context.CancelFunc     // 取消函数
 }
 
 // StreamConn 将QUIC流包装为接口
@@ -238,7 +238,7 @@ func NewClientPool(
 	keepAlive time.Duration,
 	tlsCode string,
 	hostname string,
-	targetAddr string,
+	addrResolver func() (string, error),
 ) *Pool {
 	minCap, maxCap = validateCapacity(minCap, maxCap)
 	minIvl, maxIvl = validateInterval(minIvl, maxIvl)
@@ -246,17 +246,17 @@ func NewClientPool(
 	shards := createShards(numShards)
 
 	pool := &Pool{
-		shards:     shards,
-		numShards:  numShards,
-		idChan:     make(chan string, maxCap),
-		tlsCode:    tlsCode,
-		hostname:   hostname,
-		targetAddr: targetAddr,
-		minCap:     minCap,
-		maxCap:     maxCap,
-		minIvl:     minIvl,
-		maxIvl:     maxIvl,
-		keepAlive:  keepAlive,
+		shards:       shards,
+		numShards:    numShards,
+		idChan:       make(chan string, maxCap),
+		tlsCode:      tlsCode,
+		hostname:     hostname,
+		addrResolver: addrResolver,
+		minCap:       minCap,
+		maxCap:       maxCap,
+		minIvl:       minIvl,
+		maxIvl:       maxIvl,
+		keepAlive:    keepAlive,
 	}
 	pool.capacity.Store(int32(minCap))
 	pool.interval.Store(int64(minIvl))
@@ -407,13 +407,18 @@ func (s *Shard) handleStream(stream *quic.Stream, globalChan chan string, maxCap
 }
 
 // establishConnection 为分片建立QUIC连接
-func (s *Shard) establishConnection(ctx context.Context, targetAddr, tlsCode, hostname string, keepAlive time.Duration) error {
+func (s *Shard) establishConnection(ctx context.Context, addrResolver func() (string, error), tlsCode, hostname string, keepAlive time.Duration) error {
 	conn := s.quicConn.Load()
 	if conn != nil {
 		if conn.Context().Err() == nil {
 			return nil
 		}
 		s.quicConn.Store(nil)
+	}
+
+	targetAddr, err := addrResolver()
+	if err != nil {
+		return fmt.Errorf("establishConnection: address resolution failed: %w", err)
 	}
 
 	tlsConfig := buildTLSConfig(tlsCode, hostname)
@@ -473,7 +478,7 @@ func (p *Pool) ClientManager() {
 func (p *Pool) manageShardClient(shard *Shard) {
 	for p.ctx.Err() == nil {
 		// 确保分片连接已建立
-		if err := shard.establishConnection(p.ctx, p.targetAddr, p.tlsCode, p.hostname, p.keepAlive); err != nil {
+		if err := shard.establishConnection(p.ctx, p.addrResolver, p.tlsCode, p.hostname, p.keepAlive); err != nil {
 			select {
 			case <-p.ctx.Done():
 				return

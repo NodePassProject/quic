@@ -67,6 +67,11 @@ import (
 )
 
 func main() {
+    // Create address resolver
+    addrResolver := func() (string, error) {
+        return "example.com:4433", nil
+    }
+    
     // Create a client pool
     clientPool := quic.NewClientPool(
         5, 20,                              // min/max capacity
@@ -74,7 +79,7 @@ func main() {
         30*time.Second,                     // keep-alive period
         "0",                                // TLS mode
         "example.com",                      // hostname
-        "example.com:4433",                 // target QUIC address
+        addrResolver,                       // address resolver function
     )
     defer clientPool.Close()
     
@@ -113,6 +118,11 @@ import (
 )
 
 func main() {
+    // Create address resolver
+    addrResolver := func() (string, error) {
+        return "example.com:4433", nil
+    }
+    
     // Create a new client pool with:
     // - Minimum capacity: 5 streams
     // - Maximum capacity: 20 streams (automatically creates 1 shard)
@@ -121,14 +131,14 @@ func main() {
     // - Keep-alive period: 30s for connection health monitoring
     // - TLS mode: "2" (verified certificates)
     // - Hostname for certificate verification: "example.com"
-    // - Target QUIC address: "example.com:4433"
+    // - Address resolver: Function that returns target QUIC address
     clientPool := quic.NewClientPool(
         5, 20,
         500*time.Millisecond, 5*time.Second,
         30*time.Second,
         "2",
         "example.com",
-        "example.com:4433",
+        addrResolver,
     )
     defer clientPool.Close()
     
@@ -335,14 +345,19 @@ serverPool := quic.NewServerPool(20, "", tlsConfig, "0.0.0.0:4433", 30*time.Seco
 #### Example Usage
 
 ```go
+// Address resolver function
+addrResolver := func() (string, error) {
+    return "example.com:4433", nil
+}
+
 // InsecureSkipVerify - testing only
-clientPool := quic.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "0", "example.com", "example.com:4433")
+clientPool := quic.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "0", "example.com", addrResolver)
 
 // Self-signed TLS - development/testing
-clientPool := quic.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "1", "example.com", "example.com:4433")
+clientPool := quic.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "1", "example.com", addrResolver)
 
 // Verified TLS - production
-clientPool := quic.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "2", "example.com", "example.com:4433")
+clientPool := quic.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "2", "example.com", addrResolver)
 ```
 
 ---
@@ -396,6 +411,14 @@ QUIC provides native stream multiplexing, and this package enhances it with auto
 ### Usage Examples
 
 ```go
+// Address resolvers
+addrResolver := func() (string, error) {
+    return "example.com:4433", nil
+}
+apiResolver := func() (string, error) {
+    return "api.example.com:4433", nil
+}
+
 // Small client pool - 1 shard, up to 20 streams
 clientPool := quic.NewClientPool(
     5, 20,                              // Creates 1 shard (20 ÷ 128 = 1)
@@ -403,7 +426,7 @@ clientPool := quic.NewClientPool(
     30*time.Second,                     // Keep-alive period
     "2",                                // TLS mode
     "example.com",
-    "example.com:4433",
+    addrResolver,
 )
 
 // Large client pool - 4 shards, up to 500 streams
@@ -413,7 +436,7 @@ largePool := quic.NewClientPool(
     30*time.Second,
     "2",
     "api.example.com",
-    "api.example.com:4433",
+    apiResolver,
 )
 
 // Server pool - 2 shards, accepts up to 256 streams
@@ -501,13 +524,17 @@ import (
 )
 
 func main() {
+    addrResolver := func() (string, error) {
+        return "example.com:4433", nil
+    }
+    
     clientPool := quic.NewClientPool(
         5, 20,
         500*time.Millisecond, 5*time.Second,
         30*time.Second,
         "2",
         "example.com",
-        "example.com:4433",
+        addrResolver,
     )
     
     go clientPool.ClientManager()
@@ -545,13 +572,17 @@ func main() {
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
     
+    addrResolver := func() (string, error) {
+        return "example.com:4433", nil
+    }
+    
     clientPool := quic.NewClientPool(
         5, 20,
         500*time.Millisecond, 5*time.Second,
         30*time.Second,
         "2",
         "example.com",
-        "example.com:4433",
+        addrResolver,
     )
     
     go clientPool.ClientManager()
@@ -584,13 +615,19 @@ func main() {
     pools := make([]*quic.Pool, len(serverAddresses))
     for i, addr := range serverAddresses {
         hostname := "server" + string(rune(i+49)) + ".example.com"
+        addrResolver := func(address string) func() (string, error) {
+            return func() (string, error) {
+                return address, nil
+            }
+        }(addr)
+        
         pools[i] = quic.NewClientPool(
             5, 20,
             500*time.Millisecond, 5*time.Second,
             30*time.Second,
             "2",
             hostname,
-            addr,
+            addrResolver,
         )
         go pools[i].ClientManager()
     }
@@ -743,6 +780,10 @@ if err != nil {
 minCap := expectedConcurrentStreams
 maxCap := peakConcurrentStreams * 1.5
 
+addrResolver := func() (string, error) {
+    return "api.example.com:4433", nil
+}
+
 // Example for a web service handling 100 concurrent requests
 // This will create 1 shard (100-150 streams < 128 per shard)
 clientPool := quic.NewClientPool(
@@ -751,7 +792,7 @@ clientPool := quic.NewClientPool(
     30*time.Second,                     // keep-alive
     "2",                                // verified TLS for production
     "api.example.com",                  // hostname
-    "api.example.com:4433",             // target address
+    addrResolver,                       // address resolver
 )
 
 // For high-traffic API handling 500 concurrent requests
@@ -762,7 +803,7 @@ highTrafficPool := quic.NewClientPool(
     30*time.Second,
     "2",
     "api.example.com",
-    "api.example.com:4433",
+    addrResolver,
 )
 
 log.Printf("Pool created with %d shard(s)", clientPool.ShardCount())
@@ -934,13 +975,17 @@ func createProductionPool() *quic.Pool {
 
 // Client with verified certificates
 func createProductionClient() *quic.Pool {
+    addrResolver := func() (string, error) {
+        return "secure-api.company.com:4433", nil
+    }
+    
     return quic.NewClientPool(
         20, 100,                         // Production-scale capacity
         500*time.Millisecond, 5*time.Second,
         30*time.Second,
         "2",                            // Always use verified TLS in production
         "secure-api.company.com",       // Proper hostname for certificate verification
-        "secure-api.company.com:4433",  // Target address
+        addrResolver,                   // Address resolver
     )
 }
 ```
@@ -973,7 +1018,8 @@ func (app *Application) Shutdown(ctx context.Context) error {
 // ANTI-PATTERN: Creating pools repeatedly
 func badHandler(w http.ResponseWriter, r *http.Request) {
     // DON'T: Create a new pool for each request
-    pool := quic.NewClientPool(5, 10, time.Second, time.Second, 30*time.Second, "2", "api.com", "api.com:4433")
+    addrResolver := func() (string, error) { return "api.com:4433", nil }
+    pool := quic.NewClientPool(5, 10, time.Second, time.Second, 30*time.Second, "2", "api.com", addrResolver)
     defer pool.Close()
 }
 
@@ -1001,21 +1047,27 @@ func (s *Server) goodHandler(w http.ResponseWriter, r *http.Request) {
 ```go
 // High-throughput, low-latency services
 // Creates 2 shards, up to 200 streams total
+fastResolver := func() (string, error) {
+    return "fast-api.com:4433", nil
+}
 highThroughputPool := quic.NewClientPool(
     50, 200,                           // 2 shards (200 ÷ 128 = 2)
     100*time.Millisecond, 1*time.Second, // Fast stream creation
     15*time.Second,                    // Short keep-alive for quick failure detection
-    "2", "fast-api.com", "fast-api.com:4433",
+    "2", "fast-api.com", fastResolver,
 )
 log.Printf("High-throughput pool: %d shards", highThroughputPool.ShardCount())
 
 // Very high concurrency services
 // Creates 8 shards, up to 1000 streams total
+enterpriseResolver := func() (string, error) {
+    return "enterprise-api.com:4433", nil
+}
 enterprisePool := quic.NewClientPool(
     500, 1000,                         // 8 shards (1000 ÷ 128 = 8)
     50*time.Millisecond, 500*time.Millisecond,
     20*time.Second,
-    "2", "enterprise-api.com", "enterprise-api.com:4433",
+    "2", "enterprise-api.com", enterpriseResolver,
 )
 log.Printf("Enterprise pool: %d shards", enterprisePool.ShardCount())
 
