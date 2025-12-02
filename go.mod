@@ -2,7 +2,7 @@ module github.com/NodePassProject/quic
 
 go 1.25.0
 
-require github.com/quic-go/quic-go v0.56.0
+require github.com/quic-go/quic-go v0.57.1
 
 require (
 	golang.org/x/crypto v0.45.0 // indirect

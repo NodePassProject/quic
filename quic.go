@@ -40,6 +40,7 @@ const (
 type Shard struct {
 	streams      sync.Map                      // 存储流的映射表
 	idChan       chan string                   // 可用流ID通道
+	first        atomic.Bool                   // 首次标志
 	quicConn     atomic.Pointer[quic.Conn]     // QUIC连接
 	quicListener atomic.Pointer[quic.Listener] // QUIC监听器
 	index        int                           // 分片索引
@@ -374,11 +375,10 @@ func (s *Shard) handleStream(stream *quic.Stream, globalChan chan string, maxCap
 	}
 
 	// 生成流ID
-	rawID := make([]byte, 4)
-	if _, err := rand.Read(rawID); err != nil {
+	rawID, id, err := s.generateID()
+	if err != nil {
 		return
 	}
-	id := hex.EncodeToString(rawID)
 
 	// 防止重复流ID
 	if _, exist := s.streams.Load(id); exist {
@@ -730,4 +730,18 @@ func (p *Pool) adjustCapacity(created int) {
 	if ratio > capacityAdjustHighRatio && capacity < p.maxCap {
 		p.capacity.Add(1)
 	}
+}
+
+// generateID 生成唯一流ID
+func (s *Shard) generateID() ([]byte, string, error) {
+	if s.first.CompareAndSwap(false, true) {
+		return []byte{0, 0, 0, 0}, "00000000", nil
+	}
+
+	rawID := make([]byte, 4)
+	if _, err := rand.Read(rawID); err != nil {
+		return nil, "", err
+	}
+	id := hex.EncodeToString(rawID)
+	return rawID, id, nil
 }
