@@ -43,7 +43,6 @@ type Shard struct {
 	first        atomic.Bool                   // 首次标志
 	quicConn     atomic.Pointer[quic.Conn]     // QUIC连接
 	quicListener atomic.Pointer[quic.Listener] // QUIC监听器
-	listenAddr   atomic.Pointer[net.Addr]      // 监听器地址
 	index        int                           // 分片索引
 	maxStreams   int                           // 此分片的最大流数
 }
@@ -188,16 +187,10 @@ func createStreamConn(shard *Shard, stream any) (*StreamConn, bool) {
 	if conn == nil {
 		return nil, false
 	}
-
-	localAddr := conn.LocalAddr()
-	if listenAddrPtr := shard.listenAddr.Load(); listenAddrPtr != nil {
-		localAddr = *listenAddrPtr
-	}
-
 	return &StreamConn{
 		Stream:     stream.(*quic.Stream),
 		conn:       conn,
-		localAddr:  localAddr,
+		localAddr:  conn.LocalAddr(),
 		remoteAddr: conn.RemoteAddr(),
 	}, true
 }
@@ -460,8 +453,6 @@ func (s *Shard) startListener(listenAddr string, tlsConfig *tls.Config, keepAliv
 	}
 
 	s.quicListener.Store(newListener)
-	addr := newListener.Addr()
-	s.listenAddr.Store(&addr)
 	return nil
 }
 
