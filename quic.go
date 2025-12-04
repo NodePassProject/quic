@@ -463,51 +463,65 @@ func (p *Pool) ClientManager() {
 	}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
-	var wg sync.WaitGroup
-	for i := range p.shards {
-		wg.Add(1)
-		go func(shard *Shard) {
-			defer wg.Done()
-			p.manageShardClient(shard)
-		}(p.shards[i])
-	}
-	wg.Wait()
+	go p.manageAllShardsClient()
 }
 
-// manageShardClient 管理单个分片的客户端流创建
-func (p *Pool) manageShardClient(shard *Shard) {
+// manageAllShardsClient 管理所有分片的客户端连接和流创建
+func (p *Pool) manageAllShardsClient() {
 	for p.ctx.Err() == nil {
-		// 确保分片连接已建立
-		if err := shard.establishConnection(p.ctx, p.addrResolver, p.tlsCode, p.hostname, p.keepAlive); err != nil {
-			select {
-			case <-p.ctx.Done():
-				return
-			case <-time.After(reconnectRetryInterval):
-			}
-			continue
-		}
-
 		p.adjustInterval()
 		capacity := int(p.capacity.Load())
-		// 计算分片所需容量并创建流
-		shardCapacity := (capacity + p.numShards - 1) / p.numShards
-		need := shardCapacity - len(shard.idChan)
+
+		// 计算当前总共有多少流
+		totalStreams := 0
+		for _, shard := range p.shards {
+			totalStreams += len(shard.idChan)
+		}
+
+		need := capacity - totalStreams
 		created := 0
 
 		if need > 0 {
-			var shardWg sync.WaitGroup
-			results := make(chan int, need)
-			for range need {
-				shardWg.Go(func() {
-					if shard.createStream(p.ctx, p.idChan) {
-						results <- 1
-					}
-				})
-			}
-			shardWg.Wait()
-			close(results)
-			for r := range results {
-				created += r
+			// 按顺序填充分片
+			for _, shard := range p.shards {
+				if need <= 0 {
+					break
+				}
+
+				// 确保分片连接已建立
+				if err := shard.establishConnection(p.ctx, p.addrResolver, p.tlsCode, p.hostname, p.keepAlive); err != nil {
+					time.Sleep(reconnectRetryInterval)
+					continue
+				}
+
+				// 计算该分片可创建的流数量
+				shardAvailable := shard.maxStreams - len(shard.idChan)
+				if shardAvailable <= 0 {
+					continue
+				}
+
+				// 本次在该分片创建的流数量
+				toCreate := min(need, shardAvailable)
+
+				var shardWg sync.WaitGroup
+				results := make(chan int, toCreate)
+				for range toCreate {
+					shardWg.Go(func() {
+						if shard.createStream(p.ctx, p.idChan) {
+							results <- 1
+						}
+					})
+				}
+				shardWg.Wait()
+				close(results)
+
+				shardCreated := 0
+				for r := range results {
+					shardCreated += r
+				}
+
+				created += shardCreated
+				need -= shardCreated
 			}
 		}
 
