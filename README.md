@@ -33,13 +33,13 @@ A high-performance, reliable QUIC stream pool management system for Go applicati
 
 ## Features
 
-- **Sharded architecture** with automatic connection distribution (1-64 shards per pool)
+- **Single QUIC connection architecture** with efficient stream multiplexing
 - **Lock-free design** using atomic operations for maximum performance
 - **Thread-safe stream management** with `sync.Map` and atomic pointers
 - **Support for both client and server stream pools**
 - **Dynamic capacity and interval adjustment** based on real-time usage patterns
 - **Automatic stream health monitoring** and lifecycle management
-- **QUIC connection multiplexing** with up to 128 streams per connection
+- **Concurrent stream creation** for optimal performance
 - **Multiple TLS security modes** (InsecureSkipVerify, self-signed, verified)
 - **4-byte hex stream identification** for efficient tracking
 - **Graceful error handling and recovery** with automatic retry mechanisms
@@ -142,11 +142,8 @@ func main() {
     )
     defer clientPool.Close()
     
-    // Start the client manager (manages all shards)
+    // Start the client manager
     go clientPool.ClientManager()
-    
-    // Check shard count (automatically calculated based on maxCap)
-    log.Printf("Pool initialized with %d shard(s)", clientPool.ShardCount())
     
     // Get a stream by ID with timeout (ID is 8-char hex string from server)
     timeout := 10 * time.Second
@@ -207,10 +204,8 @@ func main() {
     )
     defer serverPool.Close()
     
-    // Start the server manager (manages all shards and listeners)
+    // Start the server manager
     go serverPool.ServerManager()
-    
-    log.Printf("Server started with %d shard(s)", serverPool.ShardCount())
     
     // Accept streams in a loop
     for {
@@ -281,9 +276,6 @@ capacity := clientPool.Capacity()
 
 // Get current stream creation interval
 interval := clientPool.Interval()
-
-// Get number of shards (QUIC connections)
-numShards := clientPool.ShardCount()
 
 // Manually flush all streams (rarely needed, closes all streams)
 clientPool.Flush()
@@ -396,16 +388,16 @@ clientPool := quic.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "2", "example
 
 ## Stream Multiplexing
 
-QUIC provides native stream multiplexing, and this package enhances it with automatic sharding:
+QUIC provides native stream multiplexing, and this package uses a single QUIC connection to manage multiple concurrent streams:
 
 ### Multiplexing Features
 
-- **Automatic Sharding**: Pool automatically creates 1-32 shards based on capacity
-- **128 Streams per Shard**: Each shard (QUIC connection) supports up to 128 concurrent streams
-- **Load Distribution**: Streams are distributed across shards for optimal performance
+- **Single Connection Architecture**: One QUIC connection per pool for simplicity and efficiency
+- **Concurrent Stream Creation**: Multiple streams created in parallel using goroutines
+- **Configurable Capacity**: Dynamic adjustment of stream pool size (min/max)
 - **Independent Streams**: Each stream has isolated flow control and error handling
-- **Efficient Resource Usage**: Reduced overhead with connection pooling
-- **Automatic Management**: Pool handles shard creation, stream lifecycle, and cleanup
+- **Efficient Resource Usage**: Reduced overhead with a single connection
+- **Automatic Management**: Pool handles stream lifecycle and cleanup
 - **Built-in Keep-Alive**: Configurable keep-alive period maintains connection health
 
 ### Usage Examples
@@ -419,9 +411,9 @@ apiResolver := func() (string, error) {
     return "api.example.com:4433", nil
 }
 
-// Small client pool - 1 shard, up to 20 streams
+// Small client pool - up to 20 concurrent streams
 clientPool := quic.NewClientPool(
-    5, 20,                              // Creates 1 shard (20 ÷ 128 = 1)
+    5, 20,                              // min/max capacity
     500*time.Millisecond, 5*time.Second,
     30*time.Second,                     // Keep-alive period
     "2",                                // TLS mode
@@ -429,9 +421,9 @@ clientPool := quic.NewClientPool(
     addrResolver,
 )
 
-// Large client pool - 4 shards, up to 500 streams
+// Large client pool - up to 500 concurrent streams
 largePool := quic.NewClientPool(
-    100, 500,                           // Creates 4 shards (500 ÷ 128 = 4)
+    100, 500,                           // Higher capacity for more streams
     100*time.Millisecond, 1*time.Second,
     30*time.Second,
     "2",
@@ -439,40 +431,33 @@ largePool := quic.NewClientPool(
     apiResolver,
 )
 
-// Server pool - 2 shards, accepts up to 256 streams
+// Server pool - accepts up to 200 concurrent streams
 serverPool := quic.NewServerPool(
-    200,                                // Creates 2 shards (200 ÷ 128 = 2)
+    200,                                // Maximum concurrent streams
     "",                                 // Accept any client IP
     tlsConfig,
     "0.0.0.0:4433",
     30*time.Second,
 )
-
-// Check shard count
-log.Printf("Client pool has %d shard(s)", clientPool.ShardCount())
-log.Printf("Server pool has %d shard(s)", serverPool.ShardCount())
 ```
 
 ### Multiplexing Best Practices
 
-| Capacity (maxCap) | Shards Created | Streams per Shard | Use Case |
-|-------------------|----------------|-------------------|----------|
-| 1-128 | 1 | Up to 128 | Small applications, testing |
-| 129-256 | 2 | Up to 128 each | Medium-traffic services |
-| 257-512 | 4 | Up to 128 each | High-traffic APIs |
-| 513-1024 | 8 | Up to 128 each | Very high-concurrency |
-| 1025-4096 | 16-32 | Up to 128 each | Enterprise-scale |
-| 4097-8192 | 33-64 | Up to 128 each | Massive-scale deployments |
-
-**Shard Calculation:** `min(max((maxCap + 127) ÷ 128, 1), 64)`
+| Capacity (maxCap) | Use Case |
+|-------------------|----------|
+| 1-50 | Small applications, testing, low-traffic services |
+| 51-200 | Web applications, medium-traffic services |
+| 201-500 | High-traffic APIs, real-time systems |
+| 501-1000 | Very high-concurrency applications |
+| 1000+ | Enterprise-scale, massive concurrent workloads |
 
 **Recommendations:**
-- **Web applications**: maxCap 50-200 (1-2 shards)
-- **API services**: maxCap 200-500 (2-4 shards)
-- **Real-time systems**: maxCap 100-300 (1-3 shards) with fast intervals
-- **Batch processing**: maxCap 20-100 (1 shard) with longer intervals
-- **Enterprise services**: maxCap 500-2000 (4-16 shards)
-- **Massive-scale services**: maxCap 2000-8192 (16-64 shards)
+- **Web applications**: maxCap 50-200
+- **API services**: maxCap 200-500
+- **Real-time systems**: maxCap 100-300 with fast intervals
+- **Batch processing**: maxCap 20-100 with longer intervals
+- **Enterprise services**: maxCap 500-2000
+- **Massive-scale services**: maxCap 2000+
 
 ## Dynamic Adjustment
 
@@ -490,10 +475,10 @@ The pool automatically adjusts parameters based on real-time metrics:
 - **Increases capacity** when success rate > 80%
   - Adjustment: `capacity = min(capacity + 1, maxCapacity)`
 
-### Per-Shard Management
-- Each shard creates: `(totalCapacity + numShards - 1) ÷ numShards` streams
-- Streams are distributed evenly across all shards
-- Failed shards automatically attempt reconnection
+### Connection Management
+- Single QUIC connection manages all streams
+- Automatic reconnection on connection failure
+- Concurrent stream creation for optimal performance
 
 Monitor adjustments:
 
@@ -502,12 +487,11 @@ Monitor adjustments:
 currentCapacity := clientPool.Capacity()   // Current target capacity
 currentInterval := clientPool.Interval()   // Current creation interval
 activeStreams := clientPool.Active()       // Available streams
-numShards := clientPool.ShardCount()       // Number of shards
 
 // Calculate utilization
 utilization := float64(activeStreams) / float64(currentCapacity)
-log.Printf("Pool: %d/%d streams (%.1f%%), %d shards, %v interval",
-    activeStreams, currentCapacity, utilization*100, numShards, currentInterval)
+log.Printf("Pool: %d/%d streams (%.1f%%), %v interval",
+    activeStreams, currentCapacity, utilization*100, currentInterval)
 ```
 
 ## Advanced Usage
@@ -729,13 +713,12 @@ For ultra-high-throughput systems, consider pre-creating streams during idle per
 #### 3. Pool Exhaustion
 **Symptoms:** `IncomingGet()` returns an error or times out  
 **Solutions:**
-- Check QUIC connection status on all shards
-- Increase maximum capacity (may create more shards)
+- Check QUIC connection status
+- Increase maximum capacity
 - Reduce stream hold time in application code
 - Check for stream leaks (ensure streams are properly closed)
-- Monitor with `pool.Active()`, `pool.Capacity()`, and `pool.ShardCount()`
+- Monitor with `pool.Active()` and `pool.Capacity()`
 - Use appropriate timeout values with `IncomingGet(timeout)`
-- Check if shard limit (64) has been reached for very large pools
 
 #### 4. High Error Rate
 **Symptoms:** Frequent stream creation failures  
@@ -785,9 +768,8 @@ addrResolver := func() (string, error) {
 }
 
 // Example for a web service handling 100 concurrent requests
-// This will create 1 shard (100-150 streams < 128 per shard)
 clientPool := quic.NewClientPool(
-    100, 150,                           // min/max capacity (creates 2 shards)
+    100, 150,                           // min/max capacity
     500*time.Millisecond, 2*time.Second, // stream creation intervals
     30*time.Second,                     // keep-alive
     "2",                                // verified TLS for production
@@ -796,17 +778,14 @@ clientPool := quic.NewClientPool(
 )
 
 // For high-traffic API handling 500 concurrent requests
-// This will create 4 shards (500 ÷ 128 = 4)
 highTrafficPool := quic.NewClientPool(
-    300, 500,                           // Creates 4 shards automatically
+    300, 500,                           // Higher capacity for more streams
     100*time.Millisecond, 1*time.Second,
     30*time.Second,
     "2",
     "api.example.com",
     addrResolver,
 )
-
-log.Printf("Pool created with %d shard(s)", clientPool.ShardCount())
 ```
 
 #### Interval Configuration
@@ -922,11 +901,10 @@ func (pm *PoolManager) healthCheck() {
         active := pm.pool.Active()
         capacity := pm.pool.Capacity()
         errors := pm.pool.ErrorCount()
-        shards := pm.pool.ShardCount()
         interval := pm.pool.Interval()
         
-        pm.logger.Printf("Pool health: %d/%d streams, %d shards, %d errors, %v interval",
-            active, capacity, shards, errors, interval)
+        pm.logger.Printf("Pool health: %d/%d streams, %d errors, %v interval",
+            active, capacity, errors, interval)
         
         // Reset error count periodically
         if errors > 100 {
@@ -938,10 +916,6 @@ func (pm *PoolManager) healthCheck() {
         if utilization > 0.9 {
             pm.logger.Printf("WARNING: Pool utilization high (%.1f%%)", utilization*100)
         }
-        
-        // Check average streams per shard
-        avgPerShard := active / shards
-        pm.logger.Printf("Average %d streams per shard", avgPerShard)
     }
 }
 ```
@@ -1046,51 +1020,48 @@ func (s *Server) goodHandler(w http.ResponseWriter, r *http.Request) {
 #### Optimize for Your Use Case
 ```go
 // High-throughput, low-latency services
-// Creates 2 shards, up to 200 streams total
 fastResolver := func() (string, error) {
     return "fast-api.com:4433", nil
 }
 highThroughputPool := quic.NewClientPool(
-    50, 200,                           // 2 shards (200 ÷ 128 = 2)
+    50, 200,                           // Up to 200 concurrent streams
     100*time.Millisecond, 1*time.Second, // Fast stream creation
     15*time.Second,                    // Short keep-alive for quick failure detection
     "2", "fast-api.com", fastResolver,
 )
-log.Printf("High-throughput pool: %d shards", highThroughputPool.ShardCount())
 
 // Very high concurrency services
-// Creates 8 shards, up to 1000 streams total
 enterpriseResolver := func() (string, error) {
     return "enterprise-api.com:4433", nil
 }
 enterprisePool := quic.NewClientPool(
-    500, 1000,                         // 8 shards (1000 ÷ 128 = 8)
+    500, 1000,                         // Up to 1000 concurrent streams
     50*time.Millisecond, 500*time.Millisecond,
     20*time.Second,
     "2", "enterprise-api.com", enterpriseResolver,
 )
-log.Printf("Enterprise pool: %d shards", enterprisePool.ShardCount())
 
-// Batch processing, memory-constrained services  
-// Creates 1 shard, up to 20 streams
+// Batch processing, memory-constrained services
+batchResolver := func() (string, error) {
+    return "batch-api.com:4433", nil
+}
 batchPool := quic.NewClientPool(
-    5, 20,                             // 1 shard (20 ÷ 128 = 1)
+    5, 20,                             // Up to 20 concurrent streams
     2*time.Second, 10*time.Second,     // Slower stream creation
     60*time.Second,                    // Longer keep-alive for stable connections
-    "2", "batch-api.com", "batch-api.com:4433",
+    "2", "batch-api.com", batchResolver,
 )
-log.Printf("Batch pool: %d shard(s)", batchPool.ShardCount())
 ```
 
 #### Lock-Free Design Benefits
 ```go
 // This package's lock-free design shines in high-concurrency scenarios
 func benchmarkConcurrentAccess() {
-    // Creates 4 shards (500 ÷ 128 = 4)
-    pool := quic.NewClientPool(100, 500, 100*time.Millisecond, 1*time.Second, 30*time.Second, "1", "localhost", "localhost:4433")
+    addrResolver := func() (string, error) {
+        return "localhost:4433", nil
+    }
+    pool := quic.NewClientPool(100, 500, 100*time.Millisecond, 1*time.Second, 30*time.Second, "1", "localhost", addrResolver)
     go pool.ClientManager()
-    
-    log.Printf("Benchmark pool with %d shards", pool.ShardCount())
     
     // Simulate 1000 concurrent goroutines accessing the pool
     var wg sync.WaitGroup
@@ -1101,16 +1072,15 @@ func benchmarkConcurrentAccess() {
             // Lock-free operations: no mutex contention!
             active := pool.Active()      // channel len()
             capacity := pool.Capacity()  // atomic.Int32.Load()
-            shards := pool.ShardCount()  // simple field read
             interval := pool.Interval()  // atomic.Int64.Load()
-            _ = active + capacity + shards + int(interval)
+            _ = active + capacity + int(interval)
         }()
     }
     wg.Wait()
     
     // No performance degradation even with 1000+ concurrent readers
-    // Each shard uses sync.Map and atomic pointers for zero contention
-    // Sharding distributes load across multiple QUIC connections
+    // Uses sync.Map and atomic pointers for zero contention
+    // Single connection with concurrent stream creation
 }
 ```
 
@@ -1148,12 +1118,15 @@ func TestPoolIntegration(t *testing.T) {
     go serverPool.ServerManager()
     defer serverPool.Close()
     
-    // Create client pool  
+    // Create client pool
+    clientResolver := func() (string, error) {
+        return "localhost:14433", nil
+    }
     clientPool := quic.NewClientPool(
         2, 5, time.Second, 3*time.Second, 10*time.Second,
         "1", // Self-signed for testing
         "localhost",
-        "localhost:14433",
+        clientResolver,
     )
     go clientPool.ClientManager()
     defer clientPool.Close()
